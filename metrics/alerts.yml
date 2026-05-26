@@ -64,3 +64,16 @@ groups:
         annotations:
           summary: "Global router pause activated"
           description: "The stellar-router has been globally paused. All routing is blocked. This may indicate an incident or maintenance."
+
+      # Rate Limit Alerts
+      - alert: RateLimitApproaching
+        expr: |
+          (rate(router_middleware_total_calls[5m]) / 60) > 0.8 * 
+          scalar(count(router_middleware_total_calls) by (route))
+        for: 2m
+        labels:
+          severity: warning
+          component: middleware
+        annotations:
+          summary: "Rate limit approaching for route {{ $labels.route }}"
+          description: "Route {{ $labels.route }} is at 80% of its configured rate limit. Requests may start being rejected soon."
