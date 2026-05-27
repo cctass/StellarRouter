@@ -553,6 +553,50 @@ impl RouterAccess {
         Ok(())
     }
 
+    /// Grant a role to multiple accounts in one call.
+    ///
+    /// Iterates `accounts` and calls the same logic as `grant_role` for each.
+    /// Returns a vector of per-account results so partial failures are visible.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not super-admin or role admin.
+    pub fn grant_role_batch(
+        env: Env,
+        admin: Address,
+        accounts: Vec<Address>,
+        role: String,
+        expires_in: Option<u64>,
+    ) -> Result<Vec<Result<(), AccessError>>, AccessError> {
+        admin.require_auth();
+        Self::require_role_manager(&env, &admin, &role)?;
+        let mut results = Vec::new(&env);
+        for account in accounts.iter() {
+            results.push_back(Self::grant_role_internal(&env, &account, &role, expires_in));
+        }
+        Ok(results)
+    }
+
+    /// Revoke a role from multiple accounts in one call.
+    ///
+    /// Returns a vector of per-account results so partial failures are visible.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not super-admin or role admin.
+    pub fn revoke_role_batch(
+        env: Env,
+        caller: Address,
+        role: String,
+        targets: Vec<Address>,
+    ) -> Result<Vec<Result<(), AccessError>>, AccessError> {
+        caller.require_auth();
+        Self::require_role_manager(&env, &caller, &role)?;
+        let mut results = Vec::new(&env);
+        for target in targets.iter() {
+            results.push_back(Self::revoke_role_internal(&env, &role, &target));
+        }
+        Ok(results)
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn require_super_admin(env: &Env, caller: &Address) -> Result<(), AccessError> {
@@ -678,6 +722,93 @@ impl RouterAccess {
         }
 
         true
+    }
+
+    fn grant_role_internal(
+        env: &Env,
+        account: &Address,
+        role: &String,
+        expires_in: Option<u64>,
+    ) -> Result<(), AccessError> {
+        if Self::is_blacklisted_internal(env, account) {
+            return Err(AccessError::Blacklisted);
+        }
+        if Self::has_role_internal(env, account, role) {
+            return Err(AccessError::AlreadyHasRole);
+        }
+        let expiry_timestamp = match expires_in {
+            Some(seconds) => env.ledger().timestamp() + seconds,
+            None => u64::MAX,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::HasRole(role.clone(), account.clone()), &true);
+        let mut members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoleMembers(role.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if !members.iter().any(|a| a == *account) {
+            members.push_back(account.clone());
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::RoleMembers(role.clone()), &members);
+        let mut roles: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AddressRoles(account.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if !roles.iter().any(|r| r == *role) {
+            roles.push_back(role.clone());
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AddressRoles(account.clone()), &roles);
+        env.storage()
+            .instance()
+            .set(&DataKey::RoleExpiry(role.clone(), account.clone()), &expiry_timestamp);
+        env.events().publish(
+            (Symbol::new(env, "role_granted"),),
+            (account.clone(), role.clone(), expiry_timestamp),
+        );
+        Ok(())
+    }
+
+    fn revoke_role_internal(env: &Env, role: &String, target: &Address) -> Result<(), AccessError> {
+        let key = DataKey::HasRole(role.clone(), target.clone());
+        if !env.storage().instance().has(&key) {
+            return Err(AccessError::RoleNotFound);
+        }
+        env.storage().instance().remove(&key);
+        let mut members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoleMembers(role.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if let Some(i) = members.iter().position(|a| a == *target) {
+            members.remove(i as u32);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::RoleMembers(role.clone()), &members);
+        let mut roles: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AddressRoles(target.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if let Some(i) = roles.iter().position(|r| r == *role) {
+            roles.remove(i as u32);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AddressRoles(target.clone()), &roles);
+        env.storage()
+            .instance()
+            .remove(&DataKey::RoleExpiry(role.clone(), target.clone()));
+        env.events()
+            .publish((Symbol::new(env, "role_revoked"),), (role.clone(), target.clone()));
+        Ok(())
     }
 }
 
@@ -1286,6 +1417,91 @@ mod tests {
         let a = String::from_str(&env, "a");
         let b = String::from_str(&env, "b");
         let result = client.try_set_role_parent(&attacker, &a, &b);
+        assert_eq!(result, Err(Ok(AccessError::Unauthorized)));
+    }
+
+    // ── Batch role tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_grant_role_batch_all_succeed() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+        let accounts = soroban_sdk::vec![&env, u1.clone(), u2.clone()];
+        let results = client.grant_role_batch(&admin, &accounts, &role, &None);
+        assert_eq!(results.len(), 2);
+        for r in results.iter() {
+            assert_eq!(r, Ok(()));
+        }
+        assert!(client.has_role(&u1, &role));
+        assert!(client.has_role(&u2, &role));
+    }
+
+    #[test]
+    fn test_grant_role_batch_partial_errors() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let u1 = Address::generate(&env);
+        // Grant u1 first so the batch hits AlreadyHasRole for it
+        client.grant_role(&admin, &u1, &role, &None);
+        let u2 = Address::generate(&env);
+        let accounts = soroban_sdk::vec![&env, u1.clone(), u2.clone()];
+        let results = client.grant_role_batch(&admin, &accounts, &role, &None);
+        assert_eq!(results.get(0).unwrap(), Err(AccessError::AlreadyHasRole));
+        assert_eq!(results.get(1).unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn test_grant_role_batch_unauthorized_fails() {
+        let (env, _admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let attacker = Address::generate(&env);
+        let u1 = Address::generate(&env);
+        let accounts = soroban_sdk::vec![&env, u1];
+        let result = client.try_grant_role_batch(&attacker, &accounts, &role, &None);
+        assert_eq!(result, Err(Ok(AccessError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_revoke_role_batch_all_succeed() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+        client.grant_role(&admin, &u1, &role, &None);
+        client.grant_role(&admin, &u2, &role, &None);
+        let targets = soroban_sdk::vec![&env, u1.clone(), u2.clone()];
+        let results = client.revoke_role_batch(&admin, &role, &targets);
+        assert_eq!(results.len(), 2);
+        for r in results.iter() {
+            assert_eq!(r, Ok(()));
+        }
+        assert!(!client.has_role(&u1, &role));
+        assert!(!client.has_role(&u2, &role));
+    }
+
+    #[test]
+    fn test_revoke_role_batch_partial_errors() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env); // never granted
+        client.grant_role(&admin, &u1, &role, &None);
+        let targets = soroban_sdk::vec![&env, u1.clone(), u2.clone()];
+        let results = client.revoke_role_batch(&admin, &role, &targets);
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        assert_eq!(results.get(1).unwrap(), Err(AccessError::RoleNotFound));
+    }
+
+    #[test]
+    fn test_revoke_role_batch_unauthorized_fails() {
+        let (env, _admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let attacker = Address::generate(&env);
+        let u1 = Address::generate(&env);
+        let targets = soroban_sdk::vec![&env, u1];
+        let result = client.try_revoke_role_batch(&attacker, &role, &targets);
         assert_eq!(result, Err(Ok(AccessError::Unauthorized)));
     }
 }
