@@ -237,6 +237,7 @@ pub enum QuoteError {
     InvalidSlippage = 5,
     EmptyRoute = 6,
     RouteTooLong = 7,
+    InvalidFee = 8,
 }
 
 // Maximum hops allowed in a multi-hop route. Keeps gas costs bounded.
@@ -347,6 +348,9 @@ impl RouterQuote {
         }
         if slippage_bps > 10_000 {
             return Err(QuoteError::InvalidSlippage);
+        }
+        if fee_bps > 10_000 {
+            return Err(QuoteError::InvalidFee);
         }
 
         let hop = HopDescriptor {
@@ -695,6 +699,9 @@ impl RouterQuote {
     pub fn estimate_fee(env: Env, request: FeeEstimateRequest) -> Result<FeeEstimateResponse, QuoteError> {
         if request.amount <= 0 {
             return Err(QuoteError::InvalidAmount);
+        }
+        if request.fee_bps > 10_000 {
+            return Err(QuoteError::InvalidFee);
         }
 
         // Protocol fee: amount * fee_bps / 10000
@@ -1111,6 +1118,41 @@ mod tests {
             &1_000_000, &0, &10_001, &6,
         );
         assert_eq!(result, Err(Ok(QuoteError::InvalidSlippage)));
+    }
+
+    #[test]
+    fn test_fee_bps_exceeds_10000_fails() {
+        let (env, client, plugin) = setup();
+        let token_in = Address::generate(&env);
+        let token_out = Address::generate(&env);
+        let route = String::from_str(&env, "mock/pool");
+        let result = client.try_get_quote(
+            &plugin, &route, &token_in, &token_out,
+            &1_000_000, &10_001, &0, &6,
+        );
+        assert_eq!(result, Err(Ok(QuoteError::InvalidFee)));
+    }
+
+    #[test]
+    fn test_fee_bps_at_10000_succeeds() {
+        let (env, client, plugin) = setup();
+        let token_in = Address::generate(&env);
+        let token_out = Address::generate(&env);
+        let route = String::from_str(&env, "mock/pool");
+        // fee_bps = 10000 (100%) is the boundary — must succeed
+        let result = client.try_get_quote(
+            &plugin, &route, &token_in, &token_out,
+            &1_000_000, &10_000, &0, &6,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_estimate_fee_fee_bps_exceeds_10000_fails() {
+        let (_, client) = setup();
+        let req = FeeEstimateRequest { amount: 1_000_000, fee_bps: 10_001, network_load_bps: 0 };
+        let result = client.try_estimate_fee(&req);
+        assert_eq!(result, Err(Ok(QuoteError::InvalidFee)));
     }
 
     #[test]
