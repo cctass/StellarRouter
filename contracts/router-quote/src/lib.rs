@@ -21,6 +21,8 @@ use soroban_sdk::{
 pub enum DataKey {
     Admin,
     QuoteTtl,
+    QuoteTtl, // TTL for quotes in ledger seconds
+    HopCache(Address, Address, Address, i128), // (plugin, token_in, token_out, amount_in) -> HopCacheEntry
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -45,6 +47,13 @@ pub struct HopResult {
     pub amount_in: i128,
     pub amount_out: i128,
     pub fee_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HopCacheEntry {
+    pub amount_out: i128,
+    pub expires_at: u64,
 }
 
 /// Response for a single-hop or multi-hop quote.
@@ -110,10 +119,19 @@ pub enum QuoteError {
     InvalidSlippage = 7,
     EmptyRoute = 8,
     RouteTooLong = 9,
+    InvalidAmount = 1,
+    RouteNotFound = 2,
+    QuoteFailed = 3,
+    InvalidPrecision = 4,
+    InvalidSlippage = 5,
+    EmptyRoute = 6,
+    RouteTooLong = 7,
+    TokenMismatch = 8,
 }
 
 /// Maximum hops allowed in a multi-hop route.
 const MAX_HOPS: u32 = 5;
+const HOP_CACHE_TTL_SECS: u64 = 5;
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
@@ -256,6 +274,19 @@ impl RouterQuote {
         if slippage_bps > 10_000 {
             return Err(QuoteError::InvalidSlippage);
         }
+
+        // Validate token continuity: hop[N].token_out must equal hop[N+1].token_in
+        let hop_count = hops.len();
+        let mut i = 0u32;
+        while i + 1 < hop_count {
+            let current = hops.get(i).unwrap();
+            let next = hops.get(i + 1).unwrap();
+            if current.token_out != next.token_in {
+                return Err(QuoteError::TokenMismatch);
+            }
+            i += 1;
+        }
+
         Self::execute_hops(&env, hops, amount_in, slippage_bps, precision)
     }
 
@@ -320,6 +351,15 @@ impl RouterQuote {
         for hop in hops.iter() {
             let gross_amount_out =
                 Self::call_plugin(env, &hop.plugin, &hop.token_in, &hop.token_out, current_amount)?;
+            let gross_amount_out = Self::get_cached_hop_quote(
+                env,
+                &hop.plugin,
+                &hop.token_in,
+                &hop.token_out,
+                current_amount,
+            )?;
+
+            // Fee is taken from the input of each hop
             let fee_amount = current_amount * hop.fee_bps as i128 / 10_000;
             total_fee += fee_amount;
             hop_results.push_back(HopResult {
@@ -372,6 +412,121 @@ impl RouterQuote {
             .map_err(|_| QuoteError::QuoteFailed)?
             .map_err(|_| QuoteError::QuoteFailed)?;
         i128::try_from_val(env, &result).map_err(|_| QuoteError::QuoteFailed)
+            .map_err(|_| QuoteError::QuoteFailed)
+    }
+
+    /// Returns a hop quote, using a short-lived per-hop cache when available.
+    fn get_cached_hop_quote(
+        env: &Env,
+        plugin: &Address,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: i128,
+    ) -> Result<i128, QuoteError> {
+        let key = DataKey::HopCache(
+            plugin.clone(),
+            token_in.clone(),
+            token_out.clone(),
+            amount_in,
+        );
+        let now = env.ledger().timestamp();
+
+        if let Some(cached) = env.storage().instance().get::<DataKey, HopCacheEntry>(&key) {
+            if now < cached.expires_at {
+                return Ok(cached.amount_out);
+            }
+            env.storage().instance().remove(&key);
+        }
+
+        let amount_out = Self::call_plugin(env, plugin, token_in, token_out, amount_in)?;
+        env.storage().instance().set(
+            &key,
+            &HopCacheEntry {
+                amount_out,
+                expires_at: now + HOP_CACHE_TTL_SECS,
+            },
+        );
+
+        Ok(amount_out)
+    }
+    /// Get multiple quotes in a single call (for comparing routes).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `router_core` - Optional address of router-core contract for route resolution.
+    /// * `requests` - A vector of [`QuoteRequest`]s to process.
+    ///
+    /// # Returns
+    /// A vector of [`QuoteResponse`]s (one per request). Failed quotes
+    /// will have `amount_out = 0` and an appropriate error handling strategy.
+    pub fn get_quotes(
+        env: Env,
+        router_core: Option<Address>,
+        requests: Vec<QuoteRequest>,
+    ) -> Vec<Result<QuoteResponse, QuoteError>> {
+        let mut responses = Vec::new(&env);
+        for req in requests.iter() {
+            let result = Self::get_quote(
+                env.clone(),
+                router_core.clone(),
+                req.route_name.clone(),
+                req.token_in.clone(),
+                req.token_out.clone(),
+                req.amount_in,
+                req.slippage_bps,
+            );
+            responses.push_back(result);
+        }
+        responses
+    }
+
+    /// Estimate fees for a single transaction.
+    ///
+    /// Computes protocol and network fees based on the transaction amount,
+    /// the route's fee rate, and current network load. Surge pricing (2×
+    /// network fee) is applied when `network_load_bps` ≥ 8000 (80%).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `request` - A [`FeeEstimateRequest`] describing the transaction parameters.
+    ///
+    /// # Returns
+    /// A [`FeeEstimateResponse`] with a full fee breakdown.
+    ///
+    /// # Errors
+    /// * [`QuoteError::InvalidAmount`] — if `request.amount` ≤ 0.
+    pub fn estimate_fee(env: Env, request: FeeEstimateRequest) -> Result<FeeEstimateResponse, QuoteError> {
+        if request.amount <= 0 {
+            return Err(QuoteError::InvalidAmount);
+        }
+
+        // Protocol fee: amount * fee_bps / 10000
+        let protocol_fee = request.amount * request.fee_bps as i128 / 10_000;
+
+        // Base network fee: 100 stroops minimum
+        let base_network_fee: i128 = 100;
+
+        // Surge pricing at ≥ 80% network load
+        let (network_fee, surge_pricing, effective_fee_bps) = if request.network_load_bps >= 8_000 {
+            (base_network_fee * 2, true, request.fee_bps * 2)
+        } else {
+            (base_network_fee, false, request.fee_bps)
+        };
+
+        let total_fee = protocol_fee + network_fee;
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_estimated"),),
+            (total_fee, surge_pricing),
+        );
+
+        Ok(FeeEstimateResponse {
+            protocol_fee,
+            network_fee,
+            total_fee,
+            surge_pricing,
+            effective_fee_bps,
+        })
     }
 
     fn pow10(exp: u32) -> i128 {
@@ -599,6 +754,21 @@ mod tests {
     }
 
     #[test]
+    fn test_multihop_token_mismatch_fails() {
+        let (env, client, double, triple) = setup();
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let tc = Address::generate(&env);
+        let td = Address::generate(&env); // unrelated token — breaks chain
+
+        // Hop 1: A → B, Hop 2: C → D (B != C → TokenMismatch)
+        let mut hops = soroban_sdk::Vec::new(&env);
+        hops.push_back(HopDescriptor { plugin: double, token_in: ta, token_out: tb, fee_bps: 0 });
+        hops.push_back(HopDescriptor { plugin: triple, token_in: tc, token_out: td, fee_bps: 0 });
+
+        let r = client.try_get_multihop_quote(&hops, &1000, &0, &6);
+        assert_eq!(r, Err(Ok(QuoteError::TokenMismatch)));
+    }    #[test]
     fn test_multihop_too_many_hops_fails() {
         let (env, client, double, _) = setup();
         let ta = Address::generate(&env);
