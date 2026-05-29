@@ -606,6 +606,19 @@ impl RouterCore {
             .unwrap_or(0)
     }
 
+    /// Get the total number of registered routes.
+    ///
+    /// Returns the count of all registered routes (excluding aliases).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Returns
+    /// The total number of registered routes.
+    pub fn route_count(env: Env) -> u32 {
+        Self::get_route_names(&env).len() as u32
+    }
+
     /// Create an alias for an existing route.
     ///
     /// Associates `alias_name` with the same address as `existing_name`.
@@ -2348,5 +2361,24 @@ mod tests {
         client.register_route(&admin, &route_name, &addr, &None);
         let result = client.try_add_alias(&admin, &route_name, &whitespace_alias);
         assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
+    }
+
+    #[test]
+    fn test_route_count() {
+        let (env, admin, client) = setup();
+        assert_eq!(client.route_count(), 0);
+        
+        let name1 = String::from_str(&env, "oracle");
+        let addr1 = Address::generate(&env);
+        client.register_route(&admin, &name1, &addr1, &None);
+        assert_eq!(client.route_count(), 1);
+        
+        let name2 = String::from_str(&env, "vault");
+        let addr2 = Address::generate(&env);
+        client.register_route(&admin, &name2, &addr2, &None);
+        assert_eq!(client.route_count(), 2);
+        
+        client.remove_route(&admin, &name1);
+        assert_eq!(client.route_count(), 1);
     }
 }

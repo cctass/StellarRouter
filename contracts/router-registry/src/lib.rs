@@ -685,6 +685,22 @@ impl RouterRegistry {
         None
     }
 
+    /// Get all registered contract names.
+    ///
+    /// Returns a list of all unique contract names that have been registered.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Returns
+    /// A [`Vec<String>`] of all registered contract names.
+    pub fn get_all_names(env: Env) -> Vec<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ContractNames)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn get_versions_list(env: &Env, name: &String) -> Vec<u32> {
@@ -1558,5 +1574,27 @@ mod tests {
             let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
             assert_eq!(result, Err(Ok(RegistryError::InvalidConstraint)));
         }
+    }
+
+    #[test]
+    fn test_get_all_names() {
+        let (env, admin, client) = setup();
+        let names = client.get_all_names();
+        assert_eq!(names.len(), 0);
+
+        let name1 = String::from_str(&env, "oracle");
+        let addr1 = Address::generate(&env);
+        client.register(&admin, &name1, &addr1, &1);
+        
+        let names = client.get_all_names();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names.get(0).unwrap(), name1);
+
+        let name2 = String::from_str(&env, "vault");
+        let addr2 = Address::generate(&env);
+        client.register(&admin, &name2, &addr2, &1);
+        
+        let names = client.get_all_names();
+        assert_eq!(names.len(), 2);
     }
 }

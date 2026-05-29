@@ -928,6 +928,35 @@ mod tests {
         }
         Ok(())
     }
+
+    /// Get the count of pending operations.
+    ///
+    /// Returns the number of operations that are queued but not yet executed or cancelled.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Returns
+    /// The count of pending operations.
+    pub fn get_pending_op_count(env: Env) -> u64 {
+        let next_op_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextOpId)
+            .unwrap_or(0);
+
+        let mut count = 0u64;
+        for i in 0..next_op_id {
+            let op_id_bytes = i.to_be_bytes();
+            let op_id = Bytes::from_array(&env, &op_id_bytes);
+            if let Some(op) = env.storage().instance().get::<DataKey, Op>(&DataKey::Op(op_id)) {
+                if !op.executed && !op.cancelled {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1243,5 +1272,27 @@ mod tests {
         // Note: cancel_all() needs to be implemented
         // let count = client.cancel_all(&admin);
         // assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_get_pending_op_count() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps = Vec::new(&env);
+
+        assert_eq!(client.get_pending_op_count(), 0);
+
+        let op1 = client.queue(&admin, &String::from_str(&env, "op1"), &target, &3600, &deps);
+        assert_eq!(client.get_pending_op_count(), 1);
+
+        let op2 = client.queue(&admin, &String::from_str(&env, "op2"), &target, &3600, &deps);
+        assert_eq!(client.get_pending_op_count(), 2);
+
+        client.cancel(&admin, &op1);
+        assert_eq!(client.get_pending_op_count(), 1);
+
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+        client.execute(&admin, &op2);
+        assert_eq!(client.get_pending_op_count(), 0);
     }
 }
