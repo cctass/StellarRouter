@@ -52,7 +52,9 @@ impl RateLimitConfig {
         let window_secs =
             parse_optional_u64("ROUTER_API_RATE_WINDOW_SECS")?.unwrap_or(DEFAULT_WINDOW_SECS);
         if window_secs == 0 {
-            return Err(anyhow!("ROUTER_API_RATE_WINDOW_SECS must be greater than 0"));
+            return Err(anyhow!(
+                "ROUTER_API_RATE_WINDOW_SECS must be greater than 0"
+            ));
         }
 
         Ok(Self {
@@ -107,13 +109,10 @@ impl RateLimiter {
 
     pub fn check(&self, key: &str) -> bool {
         let now = Instant::now();
-        let mut entry = self
-            .buckets
-            .entry(key.to_string())
-            .or_insert(BucketEntry {
-                count: 0,
-                window_start: now,
-            });
+        let mut entry = self.buckets.entry(key.to_string()).or_insert(BucketEntry {
+            count: 0,
+            window_start: now,
+        });
 
         if now.duration_since(entry.window_start) >= self.config.window {
             entry.count = 0;
