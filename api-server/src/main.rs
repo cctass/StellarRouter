@@ -1,5 +1,6 @@
 mod auth;
 mod handlers;
+mod rate_limit;
 mod openapi;
 mod rpc;
 mod state;
@@ -24,7 +25,11 @@ use clap::Parser;
 use std::net::SocketAddr;
 use tracing::info;
 
-use crate::{auth::AuthConfig, state::AppState};
+use crate::{
+    auth::AuthConfig,
+    rate_limit::{rate_limit_middleware, RateLimitConfig, RateLimiter},
+    state::AppState,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "router-api-server")]
@@ -65,6 +70,14 @@ async fn main() -> Result<()> {
     let auth_config = AuthConfig::from_env();
     info!("Router auth enabled: {}", auth_config.enabled);
 
+    let rate_limit_config = RateLimitConfig::from_env()?;
+    info!(
+        max_requests = rate_limit_config.max_requests,
+        window_secs = rate_limit_config.window.as_secs(),
+        "Router API rate limiting enabled"
+    );
+    let rate_limiter = RateLimiter::new(rate_limit_config);
+
     let state = AppState::new(
         args.rpc_url,
         args.execution_contract_id,
@@ -77,6 +90,10 @@ async fn main() -> Result<()> {
         .route("/routes", get(handlers::list_routes))
         .route("/routes/:name", get(handlers::get_route))
         .route("/ws", get(websocket::ws_handler))
+        .route_layer(from_fn_with_state(
+            rate_limiter,
+            rate_limit_middleware,
+        ))
         .route_layer(from_fn_with_state(auth_config, auth::auth_middleware));
 
     let app = Router::new()
@@ -104,7 +121,11 @@ async fn main() -> Result<()> {
     info!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
